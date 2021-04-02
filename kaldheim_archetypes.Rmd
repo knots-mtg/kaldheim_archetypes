@@ -1,0 +1,171 @@
+---
+title: "Kaldheim Archetype Clustering"
+output:
+  pdf_document: default
+  html_document: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Modeling deck archetypes as biological data
+
+Like many others, I was listening to the [Limited Resources](http://lrcast.com/) episode talking about [17lands](https://www.17lands.com/), when I heard [Sierkovitz](https://twitter.com/Sierkovitz) mention that they have publicly available datasets to analyze. I immediately got excited thinking about what analyses I may be able to do with the public data, and as a bioinformatician my first thought was whether or not I could use any of the computational techniques we apply to biological data to MTG data. As odd as that may sound, I quickly realized that there are a lot of similarities between the way we describe draft decks and the way we describe single cell RNA sequencing data!
+
+For a biological organism, the first thing to consider is the genome which (if vastly oversimplified) describes the set of all possible genes that can be expressed in a cell. Likewise, in a draft environment you have the set you are drafting which describes all possible cards that can be opened in a draft booster. So in this analogy, the set is the genome of the draft environment, and the cards are the genes. This describes what is possible, but the actual functional unit of an organism is its cells. In any given cell, it technically can express any gene in the genome, but in reality only certain genes will be expressed. In a pancreas cell for example, you will find the gene for insulin being expressed, but this gene will never be active in a blood cell. Likewise, in a draft environment, the functional unit of the draft is the deck. Each deck could technically contain any card in the set, but in practice it contains a specific subset. So at this point in the analogy we have a draft environment (genome) that describes all of the cards (genes) that can ultimately be drafted to build a deck (cells).
+
+So now that we see that the draft data can be structured in a way that reflects biological data, we can apply computational techniques that have been developed for this biological data to the draft data. In particular, I thought it would be interesting to do de novo clustering of draft decks using the same techniques we use for single cell RNA sequencing data. For a single cell RNA experiment, we take thousands of individual cells and we look at which genes are expressed. Even if we don't know what cell types are in our experiment, or what genes they might express, we know that similar cells should express similar genes, and so we can cluster the cells based on the genes they express. After this is done we can dig into the clusters and see what actual genes are driving clustering, and therefore form the backbone of the cluster. In a similar way, we can take draft deck data and cluster the decks based on the cards that are present. After clustering, we can dig into the clusters and see which cards drive each cluster. The final interpretation of this would be that each cluster represents a draft archetype, and the size of the cluster represents how often that archetype ends up being drafted.
+
+The first thing to do is read in our data and get it in a form that it can be passed to existing single cell RNA seq analysis packages.
+
+```{r cars, message=FALSE, warning=FALSE}
+library(tidyverse)
+library(scRNAseq)
+library(scuttle)
+library(scran)
+library(scater)
+
+kaldheim_data <- read_csv("game-data.KHM.PremierDraft.csv")
+
+#Select only deck columns
+kaldheim_decks <- kaldheim_data %>%
+  dplyr::select(starts_with("deck"))
+
+#Normalize card names
+names(kaldheim_decks) <- names(kaldheim_decks) %>%
+  gsub("deck_" , "", .) %>%
+  gsub("[ -]", "_", .) %>%
+  gsub("[',]", "", .) %>%
+  tolower()
+
+#Remove cards that cannot actually be in the deck
+#This includes the back face of modal cards, and non-booster cards
+modal_cards <- c("tibalt_cosmic_impostor", "tidechannel_pathway", "searstep_pathway", "slitherbore_pathway", "mistgate_pathway", "sword_of_the_realms", "valkmira_protectors_shield", "hakka_whispering_raven", "the_omenkeel", "throne_of_death", "tergrids_lantern", "harnfel_horn_of_bounty", "toralfs_hammer", "the_prismatic_bridge", "kaldring_the_rimestaff", "the_ringhart_crest")
+
+non_draft_cards <- c("absorb_identity", "armed_and_armored", "bearded_axe", "canopy_tactician", "cleaving_reaper", "elderfang_ritualist", "elven_ambush", "fire_giants_fury", "giants_grasp", "gilded_assault_cart", "gladewalker_ritualist", "rampage_of_the_valkyries", "renegade_reaper", "starnheim_aspirant", "surtland_elementalist", "surtland_flinger", "thornmantle_striker", "valkyrie_harbinger", "warchanter_skald", "youthful_valkyrie")
+
+kaldheim_decks <- kaldheim_decks %>%
+  select(-all_of(modal_cards), -all_of(non_draft_cards))
+
+#Remove duplicate decks
+#Each row corresponds to a single game played, so decks show up multiple times
+kaldheim_decks <- unique(kaldheim_decks)
+
+#Remove NA rows
+kaldheim_decks <- kaldheim_decks %>%
+  filter(!is.na(alpine_meadow))
+kaldheim_unique <- kaldheim_decks
+
+#Take smaller random sample to improve runtime
+set.seed(12345)
+kaldheim_decks <- kaldheim_decks %>%
+  sample_n(3000, replace = FALSE)
+kaldheim_sample <- kaldheim_decks
+
+#Remove basic lands as they aren't actually drafted
+basic_lands <- c("island", "forest", "mountain", "plains", "swamp")
+
+kaldheim_decks <- kaldheim_decks %>%
+  select(-all_of(basic_lands))
+
+#Single cell data has genes as rows, and cells as columns
+#Transpose data to fit this data scheme
+cards <- names(kaldheim_decks)
+kaldheim_decks <- t(kaldheim_decks)
+
+#Finally, put data into a SingleCellExperiment object for use with scRNAseq packages
+kaldheim_sce <- SingleCellExperiment(list(counts = kaldheim_decks))
+```
+
+## Clustering the RNA seq data
+
+Now we can actually cluster the data. I am using the [tutorial](https://bioconductor.org/packages/devel/bioc/vignettes/scran/inst/doc/scran.html) for the scran Bioconductor package as the basis for the analysis. We would normally start with quality control to remove technical artifacts from the data, but since we know exactly which cards were drafted there shouldn't be any technical artifacts to remove. This means we can jump right into clustering! This starts using principal components analysis to reduce the dimensionality of our data. Since this is de novo clustering and we don't want to make assumptions about how many archetypes we expect to identify, we will use the getClusteredPCs function to optimize the number of clusters that maximizes finding distinct clusters without overclustering.
+
+```{r pressure, warning=FALSE}
+#Run PCA
+kaldheim_sce <- logNormCounts(kaldheim_sce)
+kaldheim_sce <- runPCA(kaldheim_sce)
+
+#Choose number of PCs to retain based on number of clusters
+output <- getClusteredPCs(reducedDim(kaldheim_sce))
+pc_n <- metadata(output)$chosen 
+reducedDim(kaldheim_sce, "PCAsub") <- reducedDim(kaldheim_sce, "PCA")[,1:pc_n,drop=FALSE]
+
+```
+
+Now that we have identified the number of clusters we expect, we can create a visualization by constructing a shared nearest-neighbor graph plotted on t-SNE coordinates. This is a visualization technique that lets you plot high-dimensional data on a 2-dimensional plane.
+
+```{r tsne, warning=FALSE}
+#Build graph for tSNE plot
+g <- buildSNNGraph(kaldheim_sce, use.dimred="PCAsub")
+cluster <- igraph::cluster_walktrap(g)$membership
+
+#Build tSNE plot
+colLabels(kaldheim_sce) <- factor(cluster)
+table(colLabels(kaldheim_sce))
+kaldheim_sce <- runTSNE(kaldheim_sce)
+plotTSNE(kaldheim_sce, colour_by="label", text_by="label")
+```
+
+We can see that we get quite a few nice clusters! These should in theory correspond to distinct draft archetypes. We can see what cards are most prevalent in each cluster to help us identify what archetype each cluster might represent. We can start by diving right into the muddled clusters at the top left.
+
+```{r card backbones}
+#Get top 20 cards from cluster 3
+colSums(kaldheim_sample[which(cluster == 3), ]) %>% sort(decreasing = TRUE) %>% head(20)
+```
+
+Cluster 3 has forest, swamp, island, and mountain all in the top 20 cards, suggesting this is a multi-color deck. It also contains quite a few snow payoffs. We can infer that this is likely 5-color snow, and this explains why this cluster is so intermingled with other clusters - it can contain many cards often seen in other archetypes.
+
+```{r cluster 7}
+#Get top 20 cards from cluster 7
+colSums(kaldheim_sample[which(cluster == 7), ]) %>% sort(decreasing = TRUE) %>% head(20)
+```
+
+Cluster 7 is very similar, but with less black and more red. This is therefore another multi-color snow archetype but with slightly different color loads.
+
+```{r cluster 12}
+#Get top 20 cards from cluster 12
+colSums(kaldheim_sample[which(cluster == 12), ]) %>% sort(decreasing = TRUE) %>% head(20)
+```
+
+Cluster 12 appears to be just blue/green snow, so while it shares many cards with clusters 3 and 7 it is distinct in its lack of red, black, and white cards.
+
+```{r cluster 10}
+#Get top 20 cards from cluster 10
+colSums(kaldheim_sample[which(cluster == 10), ]) %>% sort(decreasing = TRUE) %>% head(20)
+```
+
+Cluster 10 appears to be blue/black snow, which again is consistent with its proximity to other snow clusters.
+
+Now, what about the distinct outer clusters?
+
+```{r distinct}
+#Get top 20 cards from cluster 1
+colSums(kaldheim_sample[which(cluster == 1), ]) %>% sort(decreasing = TRUE) %>% head(20)
+```
+
+```{r distinct 2}
+#Get top 20 cards from cluster 2
+colSums(kaldheim_sample[which(cluster == 2), ]) %>% sort(decreasing = TRUE) %>% head(20)
+```
+
+```{r distinct 4}
+#Get top 20 cards from cluster 4
+colSums(kaldheim_sample[which(cluster == 4), ]) %>% sort(decreasing = TRUE) %>% head(20)
+```
+
+```{r distinct 6}
+#Get top 20 cards from cluster 6
+colSums(kaldheim_sample[which(cluster == 6), ]) %>% sort(decreasing = TRUE) %>% head(20)
+```
+
+The first thing to note is that even the outer clusters are double-colored, indicating that mono-colored decks are likely not common. From there we can see pretty clearly what each cluster represents. Cluster 1 is white/black, and cluster 2 is white/green, with their proximity being driven by their shared white cards. Cluster 4 is red/white, and cluster 6 is red/black, but even though they share red their distance is much larger than we saw in clusters 1/2. It is possible that this is caused by the two decks wanting different subsets of red cards.
+
+The analysis could continue, but from here I think the point is made that this type of analysis works and can help identify distinct draft archetypes in limited!
+
+## Future analyses
+
+There is a lot of room for expanding upon the analyses here. For example, what would it look like if we took snapshots every month of the draft environment over time? How would the clusters evolve? Does the "core" of each archetype cluster change as people improve their evaluations of each card? Also, wow does player skill affect clustering? Are clusters tighter when only considering top-drafters since they have a better idea in mind of what archetype they are building?
+
+The clusters themselves can also be useful as a classifier for decks. Once you have a new deck, you can find the cluster it belongs to and create data-driven archetype labels. With these labels you can do all kinds of other interesting analyses and build all kinds of statistical models. I look forward to seeing what comes next! 
